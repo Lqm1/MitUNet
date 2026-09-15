@@ -99,7 +99,7 @@ def export_wall_segmenter_onnx(
         str(output),
         input_names=["image"],
         output_names=["logits"],
-        dynamic_shapes={"image": {0: batch_dim}},
+        dynamic_shapes={"x": {0: batch_dim}},
         opset_version=opset,
     )
     onnx_model = onnx.load(str(output))

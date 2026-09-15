@@ -51,7 +51,12 @@ def save_binary_mask(mask: np.ndarray, path: str | Path) -> None:
 def save_overlay(image_rgb: np.ndarray, mask: np.ndarray, path: str | Path) -> None:
     """Save a red overlay of the predicted wall mask on the input image."""
     binary = (np.asarray(mask) > 0.5).astype(np.uint8)
-    overlay = np.asarray(image_rgb).copy()
+    image = np.asarray(image_rgb)
+    if image.shape[0] != binary.shape[0] or image.shape[1] != binary.shape[1]:
+        image = cv2.resize(
+            image, (binary.shape[1], binary.shape[0]), interpolation=cv2.INTER_LINEAR
+        )
+    overlay = image.copy()
     overlay[binary > 0] = (overlay[binary > 0] * 0.5 + np.array([255, 60, 60]) * 0.5).astype(
         np.uint8
     )
