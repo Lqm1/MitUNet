@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -118,6 +119,22 @@ def train(
     seed: int = typer.Option(42, help="Random seed"),
     num_workers: int = typer.Option(2, help="DataLoader workers (use 0 on Windows CPU)"),
     device: str = typer.Option("auto", help="Compute device (auto, cpu or cuda)"),
+    tensorboard_dir: Path | None = typer.Option(
+        None, help="TensorBoard log dir (default: <checkpoint_dir>/tensorboard)"
+    ),
+    no_tensorboard: bool = typer.Option(False, help="Disable TensorBoard logging"),
+    tensorboard_run_name: str = typer.Option(
+        "mitunet", help="Run name prefix (letters, digits, dots, underscores, hyphens)"
+    ),
+    tensorboard_image_every: int = typer.Option(
+        5, min=0, help="Log images at epoch 1 and every N epochs; 0 disables images"
+    ),
+    tensorboard_max_images: int = typer.Option(
+        4, min=0, help="Maximum sample images; 0 disables images"
+    ),
+    tensorboard_flush_secs: int = typer.Option(
+        30, min=1, help="TensorBoard flush interval in seconds"
+    ),
 ) -> None:
     """Train the hybrid wall segmenter on a COCO floor-plan dataset."""
     active_device = resolve_device(device)
@@ -125,6 +142,12 @@ def train(
         torch.backends.cudnn.benchmark = True
     set_random_seed(seed)
     augmentation = AugmentationConfig(image_size=image_size)
+    if no_tensorboard:
+        resolved_tensorboard_dir: str | None = None
+    elif tensorboard_dir is None:
+        resolved_tensorboard_dir = str(checkpoint_dir / "tensorboard")
+    else:
+        resolved_tensorboard_dir = str(tensorboard_dir)
     training = TrainingConfig(
         max_epochs=epochs,
         batch_size=batch_size,
@@ -132,6 +155,11 @@ def train(
         fine_tune_learning_rate=fine_tune_lr,
         seed=seed,
         checkpoint_dir=str(checkpoint_dir),
+        tensorboard_dir=resolved_tensorboard_dir,
+        tensorboard_run_name=tensorboard_run_name,
+        tensorboard_image_every=tensorboard_image_every,
+        tensorboard_max_images=tensorboard_max_images,
+        tensorboard_flush_secs=tensorboard_flush_secs,
         loss_name=loss,
         tversky_alpha=tversky_alpha,
         tversky_beta=tversky_beta,
@@ -170,8 +198,20 @@ def train(
         active_device,
         max_epochs=training.max_epochs,
         checkpoint_dir=training.checkpoint_dir,
+        tensorboard_dir=training.tensorboard_dir,
+        tensorboard_run_name=training.tensorboard_run_name,
+        log_images_every_n_epochs=training.tensorboard_image_every,
+        max_log_images=training.tensorboard_max_images,
+        tensorboard_flush_secs=training.tensorboard_flush_secs,
+        training_metadata=asdict(training),
+        image_mean=augmentation.imagenet_mean,
+        image_std=augmentation.imagenet_std,
     )
     typer.echo(f"Best checkpoint: {best_path} (valid_iou={best_iou:.4f})")
+    if training.tensorboard_dir is not None:
+        typer.echo(
+            f"TensorBoard logs: {training.tensorboard_dir} (tensorboard --logdir={training.tensorboard_dir})"
+        )
 
 
 @app.command()
