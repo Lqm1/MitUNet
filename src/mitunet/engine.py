@@ -15,7 +15,12 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 from mitunet.objectives import loss_display_name
-from mitunet.scores import SegmentationScores, binarize_logits, boundary_iou, summarize_scores
+from mitunet.scores import (
+    SegmentationScores,
+    binarize_logits,
+    boundary_iou_tensor,
+    summarize_scores,
+)
 from mitunet.tensorboard import create_writer, should_log_images
 
 # Must stay in sync with AugmentationConfig defaults (used to unnormalize
@@ -39,17 +44,16 @@ class EpochHistory:
 
 def _accumulate_confusion(
     logits: torch.Tensor, masks: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     predictions = binarize_logits(logits)
     true_positive, false_positive, false_negative, true_negative = smp.metrics.get_stats(
         predictions.long(), masks.long(), mode="binary"
     )
     return (
-        true_positive.sum().detach().cpu(),
-        false_positive.sum().detach().cpu(),
-        false_negative.sum().detach().cpu(),
-        true_negative.sum().detach().cpu(),
-        predictions.detach().cpu(),
+        true_positive.sum().detach(),
+        false_positive.sum().detach(),
+        false_negative.sum().detach(),
+        true_negative.sum().detach(),
     )
 
 
@@ -62,29 +66,29 @@ def train_one_epoch(
 ) -> tuple[float, float]:
     """Run a single training epoch and return (loss, IoU)."""
     model.train()
-    running_loss = 0.0
-    total_tp = torch.tensor(0.0)
-    total_fp = torch.tensor(0.0)
-    total_fn = torch.tensor(0.0)
-    total_tn = torch.tensor(0.0)
+    running_loss = torch.zeros((), dtype=torch.float64, device=device)
+    total_tp = torch.zeros((), dtype=torch.int64, device=device)
+    total_fp = torch.zeros((), dtype=torch.int64, device=device)
+    total_fn = torch.zeros((), dtype=torch.int64, device=device)
+    total_tn = torch.zeros((), dtype=torch.int64, device=device)
     progress = tqdm(loader, desc="Training", leave=False)
     for images, masks in progress:
-        images = images.to(device)
-        masks = masks.to(device).unsqueeze(1).float()
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True).unsqueeze(1).float()
         optimizer.zero_grad()
         outputs = model(images)
         loss = loss_fn(outputs, masks)
         loss.backward()
         optimizer.step()
-        running_loss += float(loss.item()) * images.size(0)
-        tp, fp, fn, tn, _ = _accumulate_confusion(outputs, masks)
+        running_loss += loss.detach().double() * images.size(0)
+        tp, fp, fn, tn = _accumulate_confusion(outputs, masks)
         total_tp += tp
         total_fp += fp
         total_fn += fn
         total_tn += tn
-        progress.set_postfix(loss=f"{loss.item():.4f}")
+
     epoch_iou = smp.metrics.iou_score(total_tp, total_fp, total_fn, total_tn)
-    return running_loss / len(loader.dataset), float(epoch_iou.item())  # type: ignore[arg-type]
+    return running_loss.item() / len(loader.dataset), float(epoch_iou.item())  # type: ignore[arg-type]
 
 
 @torch.no_grad()
@@ -98,12 +102,12 @@ def validate_one_epoch(
 ) -> tuple[float, SegmentationScores, float, float]:
     """Run validation and return (loss, scores, fps, peak VRAM in MiB)."""
     model.eval()
-    running_loss = 0.0
-    total_tp = torch.tensor(0.0)
-    total_fp = torch.tensor(0.0)
-    total_fn = torch.tensor(0.0)
-    total_tn = torch.tensor(0.0)
-    boundary_sum = 0.0
+    running_loss = torch.zeros((), dtype=torch.float64, device=device)
+    total_tp = torch.zeros((), dtype=torch.int64, device=device)
+    total_fp = torch.zeros((), dtype=torch.int64, device=device)
+    total_fn = torch.zeros((), dtype=torch.int64, device=device)
+    total_tn = torch.zeros((), dtype=torch.int64, device=device)
+    boundary_sum = torch.zeros((), dtype=torch.float64, device=device)
     batch_count = 0
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -111,8 +115,8 @@ def validate_one_epoch(
     start = time.perf_counter()
     progress = tqdm(loader, desc="Validation", leave=False)
     for images, masks in progress:
-        images = images.to(device)
-        masks = masks.to(device).unsqueeze(1).float()
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True).unsqueeze(1).float()
         outputs = model(images)
         if samples is not None and not samples:
             samples.append(
@@ -123,16 +127,16 @@ def validate_one_epoch(
                 )
             )
         loss = loss_fn(outputs, masks)
-        running_loss += float(loss.item()) * images.size(0)
+        running_loss += loss.detach().double() * images.size(0)
         predictions = binarize_logits(outputs)
         tp, fp, fn, tn = smp.metrics.get_stats(predictions.long(), masks.long(), mode="binary")
-        total_tp += tp.sum().detach().cpu()
-        total_fp += fp.sum().detach().cpu()
-        total_fn += fn.sum().detach().cpu()
-        total_tn += tn.sum().detach().cpu()
-        boundary_sum += boundary_iou(predictions, masks)
+        total_tp += tp.sum().detach()
+        total_fp += fp.sum().detach()
+        total_fn += fn.sum().detach()
+        total_tn += tn.sum().detach()
+        boundary_sum += boundary_iou_tensor(predictions, masks).double()
         batch_count += 1
-        progress.set_postfix(loss=f"{loss.item():.4f}")
+
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elapsed = max(time.perf_counter() - start, 1e-6)
@@ -141,9 +145,9 @@ def validate_one_epoch(
     peak_vram = (
         float(torch.cuda.max_memory_allocated(device) / (1024**2)) if device.type == "cuda" else 0.0
     )
-    mean_boundary = boundary_sum / max(batch_count, 1)
+    mean_boundary = boundary_sum.item() / max(batch_count, 1)
     scores = summarize_scores(total_tp, total_fp, total_fn, total_tn, mean_boundary)
-    return running_loss / dataset_size, scores, fps, peak_vram
+    return running_loss.item() / dataset_size, scores, fps, peak_vram
 
 
 @torch.no_grad()
@@ -155,26 +159,26 @@ def evaluate_dataset(
 ) -> SegmentationScores:
     """Compute full-dataset metrics without a loss function."""
     model.eval()
-    total_tp = torch.tensor(0.0)
-    total_fp = torch.tensor(0.0)
-    total_fn = torch.tensor(0.0)
-    total_tn = torch.tensor(0.0)
-    boundary_sum = 0.0
+    total_tp = torch.zeros((), dtype=torch.int64, device=device)
+    total_fp = torch.zeros((), dtype=torch.int64, device=device)
+    total_fn = torch.zeros((), dtype=torch.int64, device=device)
+    total_tn = torch.zeros((), dtype=torch.int64, device=device)
+    boundary_sum = torch.zeros((), dtype=torch.float64, device=device)
     batch_count = 0
     for images, masks in tqdm(loader, desc="Metrics", leave=False):
-        images = images.to(device)
-        masks = masks.to(device).unsqueeze(1).float()
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True).unsqueeze(1).float()
         outputs = model(images)
         predictions = (torch.sigmoid(outputs) > threshold).float()
         tp, fp, fn, tn = smp.metrics.get_stats(predictions.long(), masks.long(), mode="binary")
-        total_tp += tp.sum().detach().cpu()
-        total_fp += fp.sum().detach().cpu()
-        total_fn += fn.sum().detach().cpu()
-        total_tn += tn.sum().detach().cpu()
-        boundary_sum += boundary_iou(predictions, masks)
+        total_tp += tp.sum().detach()
+        total_fp += fp.sum().detach()
+        total_fn += fn.sum().detach()
+        total_tn += tn.sum().detach()
+        boundary_sum += boundary_iou_tensor(predictions, masks).double()
         batch_count += 1
     return summarize_scores(
-        total_tp, total_fp, total_fn, total_tn, boundary_sum / max(batch_count, 1)
+        total_tp, total_fp, total_fn, total_tn, boundary_sum.item() / max(batch_count, 1)
     )
 
 
@@ -190,7 +194,7 @@ def benchmark_throughput(
     start = time.perf_counter()
     frames = 0
     for images, _ in loader:
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
         _ = model(images)
         frames += images.size(0)
     if device.type == "cuda":

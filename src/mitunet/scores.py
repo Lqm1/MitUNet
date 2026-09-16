@@ -32,6 +32,14 @@ def boundary_iou(
     radius scales with the image diagonal so the metric stays resolution
     invariant.
     """
+    return float(boundary_iou_tensor(predicted, target, dilation_ratio).item())
+
+
+@torch.no_grad()
+def boundary_iou_tensor(
+    predicted: torch.Tensor, target: torch.Tensor, dilation_ratio: float = 0.02
+) -> torch.Tensor:
+    """Device scalar version for accumulation without per-batch synchronization."""
     with torch.no_grad():
         predictions = (predicted.detach() > 0.5).float()
         references = (target.detach() > 0.5).float()
@@ -52,7 +60,7 @@ def boundary_iou(
         target_edge = (references - target_eroded).flatten(1)
         intersection = (predicted_edge * target_edge).sum(dim=1)
         union = (predicted_edge + target_edge).clamp(0, 1).sum(dim=1)
-        return float((intersection / (union + 1e-7)).mean().item())
+        return (intersection / (union + 1e-7)).mean()
 
 
 def summarize_scores(

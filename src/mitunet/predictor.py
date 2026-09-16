@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from mitunet.architecture import build_wall_segmenter, load_wall_segmenter_weights
+from mitunet.architecture import build_wall_segmenter, model_from_checkpoint
 from mitunet.augmentation import build_inference_transforms
 from mitunet.config import AugmentationConfig, InferenceConfig, ModelConfig
 
@@ -41,8 +41,7 @@ class WallPredictor:
         preprocessing: AugmentationConfig | None = None,
     ) -> WallPredictor:
         """Build a predictor from a ``.pth`` wall-segmentation checkpoint."""
-        model = build_wall_segmenter(model_config)
-        load_wall_segmenter_weights(model, checkpoint_path, device, strict=False)
+        model = model_from_checkpoint(checkpoint_path, device, model_config)
         return cls(model, device, inference=inference, preprocessing=preprocessing)
 
     @classmethod
@@ -56,7 +55,7 @@ class WallPredictor:
         model = build_wall_segmenter(model_config or ModelConfig())
         return cls(model, device, inference=inference)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict_proba(self, image_rgb: np.ndarray) -> np.ndarray:
         """Return a wall probability map in the model's input resolution."""
         augmented = self.transforms(image=np.asarray(image_rgb))
@@ -86,8 +85,7 @@ def export_wall_segmenter_onnx(
     import onnxruntime as ort
 
     device = torch.device("cpu")
-    model = build_wall_segmenter(model_config)
-    load_wall_segmenter_weights(model, checkpoint_path, device, strict=False)
+    model = model_from_checkpoint(checkpoint_path, device, model_config)
     model.eval()
     dummy = torch.randn(1, 3, image_size, image_size)
     output = Path(output_path)

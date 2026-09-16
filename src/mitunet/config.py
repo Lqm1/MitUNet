@@ -45,6 +45,8 @@ class TrainingConfig:
     weight_decay: float = 0.0
     scheduler_factor: float = 0.5
     scheduler_patience: int = 3
+    persistent_workers: bool = False
+    target_cache_mb: int = 256
     num_workers: int = 2
     seed: int = 42
     validation_split: float = 0.2

@@ -9,7 +9,11 @@ import torch
 import typer
 from torch.utils.data import DataLoader, random_split
 
-from mitunet.architecture import build_wall_segmenter, count_trainable_parameters
+from mitunet.architecture import (
+    build_wall_segmenter,
+    count_trainable_parameters,
+    model_from_checkpoint,
+)
 from mitunet.augmentation import build_training_transforms, build_validation_transforms
 from mitunet.config import AugmentationConfig, InferenceConfig, ModelConfig, TrainingConfig
 from mitunet.engine import evaluate_dataset, fit_wall_segmenter
@@ -54,6 +58,7 @@ def _build_coco_loaders(
             transforms=None,
             opening_thickness_px=training.augmentation.opening_thickness_px,
             closing_kernel_size=training.augmentation.closing_kernel_size,
+            target_cache_mb=training.target_cache_mb,
         )
         valid_base = CocoWallDataset(
             valid_dir,
@@ -61,6 +66,7 @@ def _build_coco_loaders(
             transforms=None,
             opening_thickness_px=training.augmentation.opening_thickness_px,
             closing_kernel_size=training.augmentation.closing_kernel_size,
+            target_cache_mb=training.target_cache_mb,
         )
         train_dataset: torch.utils.data.Dataset = TransformedView(train_base, train_transforms)
         valid_dataset: torch.utils.data.Dataset = TransformedView(valid_base, valid_transforms)
@@ -73,6 +79,7 @@ def _build_coco_loaders(
             transforms=None,
             opening_thickness_px=training.augmentation.opening_thickness_px,
             closing_kernel_size=training.augmentation.closing_kernel_size,
+            target_cache_mb=training.target_cache_mb,
         )
         generator = torch.Generator().manual_seed(training.seed)
         train_size = int((1.0 - training.validation_split) * len(combined))
@@ -87,7 +94,8 @@ def _build_coco_loaders(
         batch_size=training.batch_size,
         shuffle=True,
         num_workers=training.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=device.type == "cuda",
+        persistent_workers=training.persistent_workers and training.num_workers > 0,
         worker_init_fn=seed_worker,
         generator=generator_seed,
     )
@@ -96,7 +104,8 @@ def _build_coco_loaders(
         batch_size=training.batch_size,
         shuffle=False,
         num_workers=training.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=device.type == "cuda",
+        persistent_workers=training.persistent_workers and training.num_workers > 0,
         worker_init_fn=seed_worker,
     )
     return train_loader, valid_loader
@@ -121,6 +130,12 @@ def train(
     device: str = typer.Option("auto", help="Compute device (auto, cpu or cuda)"),
     tensorboard_dir: Path | None = typer.Option(
         None, help="TensorBoard log dir (default: <checkpoint_dir>/tensorboard)"
+    ),
+    persistent_workers: bool = typer.Option(
+        False, help="Reuse workers across epochs; changes augmentation RNG sequence"
+    ),
+    target_cache_mb: int = typer.Option(
+        256, min=0, help="Target cache MiB per dataset per worker; 0 disables"
     ),
     no_tensorboard: bool = typer.Option(False, help="Disable TensorBoard logging"),
     tensorboard_run_name: str = typer.Option(
@@ -156,6 +171,8 @@ def train(
         seed=seed,
         checkpoint_dir=str(checkpoint_dir),
         tensorboard_dir=resolved_tensorboard_dir,
+        persistent_workers=persistent_workers,
+        target_cache_mb=target_cache_mb,
         tensorboard_run_name=tensorboard_run_name,
         tensorboard_image_every=tensorboard_image_every,
         tensorboard_max_images=tensorboard_max_images,
@@ -169,14 +186,12 @@ def train(
     )
     train_loader, valid_loader = _build_coco_loaders(dataset_root, training, active_device)
     typer.echo(f"train_batches={len(train_loader)} valid_batches={len(valid_loader)}")
-    model = build_wall_segmenter(training.model)
     if fine_tune is not None:
-        from mitunet.architecture import load_wall_segmenter_weights
-
-        load_wall_segmenter_weights(model, fine_tune, active_device, strict=False)
+        model = model_from_checkpoint(fine_tune, active_device, training.model)
         effective_lr = training.fine_tune_learning_rate
         typer.echo(f"Fine-tuning from {fine_tune} (lr={effective_lr})")
     else:
+        model = build_wall_segmenter(training.model)
         effective_lr = training.learning_rate
     model.to(active_device)
     typer.echo(f"parameters={count_trainable_parameters(model)} device={active_device.type}")
@@ -236,8 +251,8 @@ def infer(
         preprocessing=AugmentationConfig(image_size=image_size),
     )
     rgb = load_rgb_image(image)
-    mask = predictor.predict_mask(rgb)
     proba = predictor.predict_proba(rgb)
+    mask = (proba > inference.threshold).astype("uint8")
     save_binary_mask(mask, output_dir / f"{image.stem}_wall.png")
     save_overlay(rgb, mask, output_dir / f"{image.stem}_overlay.png")
     typer.echo(
@@ -281,6 +296,7 @@ def evaluate(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
+        pin_memory=active_device.type == "cuda",
         worker_init_fn=seed_worker,
     )
     predictor = WallPredictor.from_checkpoint(

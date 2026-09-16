@@ -12,6 +12,8 @@ import torch
 from pycocotools.coco import COCO
 from torch.utils.data import Dataset
 
+from mitunet.target_cache import TargetCache, file_version
+
 TransformFn = Callable[..., dict]
 
 
@@ -31,12 +33,16 @@ class CocoWallDataset(Dataset[tuple[np.ndarray | torch.Tensor, np.ndarray | torc
         transforms: TransformFn | None = None,
         opening_thickness_px: int = 30,
         closing_kernel_size: int = 5,
+        target_cache_mb: int = 256,
     ) -> None:
         self.image_dir = Path(image_dir)
         self.transforms = transforms
         self.opening_thickness_px = int(opening_thickness_px)
         self.closing_kernel_size = int(closing_kernel_size)
         self.coco = COCO(str(annotation_path))
+        self.annotation_path = Path(annotation_path)
+        self.annotation_version = file_version(annotation_path)
+        self.target_cache = TargetCache(target_cache_mb)
         self.image_ids: list[int] = self.coco.getImgIds()
         if not self.image_ids:
             raise ValueError(f"No images found in {annotation_path}")
@@ -85,6 +91,8 @@ class CocoWallDataset(Dataset[tuple[np.ndarray | torch.Tensor, np.ndarray | torc
         return (cleaned > 127).astype(np.uint8)
 
     def __getitem__(self, index: int) -> tuple:
+        if file_version(self.annotation_path) != self.annotation_version:
+            raise RuntimeError("COCO annotations changed during use; recreate the dataset")
         image_id = self.image_ids[index]
         info = self.coco.loadImgs(image_id)[0]
         image_path = self.image_dir / info["file_name"]
@@ -96,7 +104,20 @@ class CocoWallDataset(Dataset[tuple[np.ndarray | torch.Tensor, np.ndarray | torc
         height, width = int(info["height"]), int(info["width"])
         annotation_ids = self.coco.getAnnIds(imgIds=image_id)
         annotations = self.coco.loadAnns(annotation_ids)
-        mask = self.build_wall_mask(annotations, height, width)
+        key = (
+            image_id,
+            self.annotation_version,
+            height,
+            width,
+            self.opening_thickness_px,
+            self.closing_kernel_size,
+        )
+        cached = self.target_cache.get(key)
+        if cached is None:
+            mask = self.build_wall_mask(annotations, height, width)
+            self.target_cache.put(key, (mask,))
+        else:
+            (mask,) = cached
         if image.shape[0] != mask.shape[0] or image.shape[1] != mask.shape[1]:
             mask = cv2.resize(
                 mask,
